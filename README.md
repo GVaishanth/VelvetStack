@@ -10,9 +10,10 @@ A complete, responsive poker web app that runs entirely in the browser. Velvet S
 - **Local multiplayer:** physical-deck dealer mode for 2–8 people. The app never deals or displays hole-card values; use your real deck, while Velvet Stack manages turns, blinds, pot, betting, and showdown winner selection.
 - **Online room:** host a private six-character room and invite up to 7 players with a code.
 - **Responsive table:** works on desktop, tablet, and mobile layouts.
-- **Texas Hold'em flow:** cut deck → deal privately → pre-flop → open flop → turn → river → showdown. Local mode includes a dealer desk for cutting, tracking openings, and manually selecting the winner.
+- **Texas Hold'em flow:** cut deck → deal privately → pre-flop → open flop → turn → river → showdown. Local mode uses guided dealer pop-ups for cutting, dealing, and opening each board street.
 - **Table rules:** dealer button and blinds rotate each hand, folded players are excluded from bet calculations, all-in stacks cannot make further actions, and the local dealer confirms each board opening with **Open next cards**.
-- **Table management:** use the Players page to add or remove local players between hands; use the dedicated Showdown page to choose the physical-deck winner.
+- **Table management:** use the Players page to add or remove local players between hands; use the dedicated Showdown page to choose the physical-deck winner. After a local winner is selected, the table waits 5 seconds silently, then shows a 5-second restart countdown.
+- **Undo:** Solo supports multiple human-action undos and reshuffles its remaining digital deck; Local supports multiple dealer/player undos while preserving the physical deck order.
 - **Table controls:** fold, check, call, raise, new hand, copy room code, and keyboard shortcuts.
 - **No account:** no sign-in, player profile, or server-side data is required.
 - **Installable metadata:** includes a web app manifest for supported browsers.
