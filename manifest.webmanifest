@@ -1,0 +1,10 @@
+{
+  "name": "Velvet Stack — Texas Hold'em",
+  "short_name": "Velvet Stack",
+  "description": "A static Texas Hold'em table for solo, local, and online play.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#071714",
+  "theme_color": "#081d1a",
+  "icons": []
+}
