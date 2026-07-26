@@ -6,9 +6,9 @@ A complete, responsive poker web app that runs entirely in the browser. Velvet S
 
 ## Live features
 
-- **Solo table:** play Texas Hold'em against seven bot opponents with Casual, Sharp, and Pro difficulty levels.
+- **Solo table:** play Texas Hold'em against bot opponents with Casual, Sharp, and Pro difficulty levels. Meld House and Color Clash also offer Turbo or Realistic bot speed.
 - **Local multiplayer:** physical-deck dealer mode for 2–8 people. The app never deals or displays hole-card values; use your real deck, while Velvet Stack manages turns, blinds, pot, betting, and showdown winner selection.
-- **Online room:** host a private six-character room and invite up to 7 players with a code.
+- **Online room:** host a private six-character room and invite friends with a code.
 - **Responsive table:** works on desktop, tablet, and mobile layouts.
 - **Texas Hold'em flow:** cut deck → deal privately → pre-flop → open flop → turn → river → showdown. Local mode uses guided dealer pop-ups for cutting, dealing, and opening each board street.
 - **Table rules:** dealer button and blinds rotate each hand, folded players are excluded from bet calculations, all-in stacks cannot make further actions, and the local dealer confirms each board opening with **Open next cards**.
@@ -35,7 +35,7 @@ Then open [http://localhost:8000](http://localhost:8000).
 ### Option A: GitHub website
 
 1. Create a new GitHub repository.
-2. Upload `index.html`, `styles.css`, `app.js`, `manifest.webmanifest`, and `.nojekyll`.
+2. Upload the complete project folder, including `index.html`, `home.css`, `home.js`, `poker.html`, `styles.css`, `app.js`, `game.html`, `game.css`, `game.js`, `manifest.webmanifest`, and `.nojekyll`.
 3. Open **Settings → Pages**.
 4. Under **Build and deployment**, select **Deploy from a branch**.
 5. Select the `main` branch and the `/ (root)` folder, then press **Save**.
@@ -79,9 +79,13 @@ If PeerJS is unavailable, solo and local modes remain usable; choose **Local mul
 
 ```text
 .
-├── index.html             # App shell and accessible UI markup
-├── styles.css             # Responsive visual system and poker table layout
-├── app.js                 # Deck, hand state, bot logic, UI, and PeerJS room logic
+├── index.html             # Velvet Stack game library home
+├── home.css / home.js     # Animated game library UI
+├── poker.html             # Poker table app (legacy poker code preserved)
+├── styles.css             # Poker table visual system
+├── app.js                 # Poker deck, hand state, bot logic, UI, and PeerJS room logic
+├── game.html              # Shared shell for Rummy, Ace High, UNO, and UNO Flip
+├── game.css / game.js     # Shared non-poker card game UI and engines
 ├── manifest.webmanifest   # Optional installable web-app metadata
 ├── .nojekyll              # Prevents GitHub Pages Jekyll processing
 └── README.md              # This guide
