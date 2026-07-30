@@ -84,7 +84,7 @@ If PeerJS is unavailable, solo and local modes remain usable; choose **Local mul
 ├── poker.html             # Poker table app (legacy poker code preserved)
 ├── styles.css             # Poker table visual system
 ├── app.js                 # Poker deck, hand state, bot logic, UI, and PeerJS room logic
-├── game.html              # Shared shell for Rummy, Ace High, UNO, and UNO Flip
+├── game.html              # Shared shell for Rummy and UNO
 ├── game.css / game.js     # Shared non-poker card game UI and engines
 ├── manifest.webmanifest   # Optional installable web-app metadata
 ├── .nojekyll              # Prevents GitHub Pages Jekyll processing

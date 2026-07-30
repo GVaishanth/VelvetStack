@@ -81,7 +81,7 @@ function start(kind = 'single', names, setup) {
     street: 'preflop',
     dealer: 0,
     turn: 0,
-    players: players(kind === 'local' ? Math.max(2, Math.min(8, names?.length || 4)) : kind === 'online' ? Math.max(2, Math.min(8, names?.length || 2)) : 8, names),
+    players: players(kind === 'local' ? Math.max(2, Math.min(8, names?.length || 4)) : kind === 'online' ? Math.max(2, Math.min(8, names?.length || 2)) : 1 + Math.max(1, Math.min(7, Number(localStorage.getItem('velvet-stack-bot-count')) || 7)), names),
     handNo: 1,
     winner: null,
     started: false,
@@ -103,7 +103,10 @@ function start(kind = 'single', names, setup) {
   $('#deckStatus').textContent = kind === 'local' ? 'Deck ready — cut before dealing' : 'Deck ready';
   render();
   if (kind === 'local') showDealerStep('cut');
-  else setTimeout(deal, 300)
+  else if (kind === 'online') {
+    $('#deckStatus').textContent = 'Waiting for a guest to join';
+    $('#actionHint').textContent = 'Share the room code — the hand starts when a guest arrives.';
+  } else setTimeout(deal, 300)
 }
 
 function nextPlayer(from) {
@@ -125,6 +128,7 @@ function putBlind(index, amount) {
 }
 
 function deal() {
+  if (!game || game.started) return toast('A hand is already in progress');
   if (mode === 'local' && !game.cut) return toast('Cut the deck before dealing');
   hideDealerStep();
   game.players.forEach(p => { p.bet = 0; p.acted = false; p.folded = false });
@@ -149,6 +153,7 @@ function deal() {
   $('#deckStatus').textContent = 'Hand dealt — betting open';
   $('#dealHandBtn').textContent = 'Hand dealt';
   render();
+  sync();
   autoProgress()
 }
 
@@ -269,7 +274,9 @@ function undoLast() {
 }
 
 function act(a, amount) {
-  if (!game || !game.started || game.winner !== null) return;
+  if (!['fold', 'check', 'call', 'raise'].includes(a)) return;
+  if (!game || !game.started || game.winner !== null || game.needsTableReset) return;
+  if (a === 'raise' && (!Number.isFinite(Number(amount)) || Number(amount) < 0)) return toast('Invalid raise amount');
   let p = game.players[game.turn],
     maxBet = Math.max(...game.players.filter(x => !x.folded).map(x => x.bet));
   if (a === 'check' && p.bet < maxBet) {
@@ -308,13 +315,17 @@ function act(a, amount) {
     // not reset the minimum for players acting after it.
     let m = Math.max(...game.players.filter(x => !x.folded).map(x => x.bet)),
       minIncrement = game.minRaise || 2,
-      requested = amount || (m + minIncrement),
-      target = Math.max(m + minIncrement, requested),
-      paid = Math.min(p.chips, target - p.bet);
-    if (paid <= 0) return toast('Raise is not available');
-    let reachedFullRaise = (p.bet + paid) >= target;
+      minTarget = m + minIncrement,
+      maxTarget = p.bet + p.chips,
+      target = amount === undefined ? minTarget : Math.floor(Number(amount));
+    target = Math.min(target, maxTarget);
+    if (target <= m) return toast('Raise is not available');
+    // A raise below the minimum is legal only when it is the player's full all-in stack.
+    if (target < minTarget && target !== maxTarget) return toast(`Raise to at least $${minTarget}`);
+    let paid = target - p.bet;
+    let reachedFullRaise = target >= minTarget;
     p.chips -= paid;
-    p.bet += paid;
+    p.bet = target;
     p.totalBet = (p.totalBet || 0) + paid;
     game.pot += paid;
     p.acted = true;
@@ -333,19 +344,36 @@ function queueBot() {
 }
 
 function botEquity(p) {
-  let h = p.hand || [], all = [...h, ...game.community];
+  let h = p.hand || [], board = game.community || [];
   if (!h.length) return .5;
-  if (!game.community.length) {
+  if (!board.length) {
     let vals = h.map(c => c.value).sort((a, b) => b - a),
-      pair = vals[0] === vals[1],
-      high = vals[0] >= 12,
-      connected = vals[0] - vals[1] <= 2,
-      suited = h[0].suit === h[1].suit;
-    return Math.min(.9, .18 + (pair ? .34 : 0) + (high ? .13 : 0) + (connected ? .07 : 0) + (suited ? .06 : 0) + (vals[0] === 14 ? .06 : 0))
+      pair = vals[0] === vals[1], high = vals[0] >= 12,
+      connected = vals[0] - vals[1] <= 2, suited = h[0].suit === h[1].suit;
+    return Math.min(.92, .14 + (pair ? .38 : 0) + (high ? .16 : 0) + (connected ? .08 : 0) + (suited ? .07 : 0) + (vals[0] === 14 ? .07 : 0))
   }
-  return Math.min(.98, .08 + (evaluate(all).rank / 8) * .82)
+  // A small Monte Carlo estimate makes post-flop bots react to draws, kickers,
+  // and the number of opponents instead of merely the current hand category.
+  let used = new Set([...h, ...board].map(c => c.rank + c.suit));
+  let pool = SUITS.flatMap(suit => RANKS.map((rank, i) => ({ suit, rank, value: i + 2 }))).filter(c => !used.has(c.rank + c.suit));
+  let opponents = game.players.filter(x => x.id !== p.id && !x.folded && x.chips > 0).length;
+  let trials = game.botLevel === 'pro' ? 100 : 55, score = 0;
+  for (let t = 0; t < trials; t++) {
+    let sample = [...pool];
+    for (let i = sample.length - 1; i > 0; i--) { let j = Math.floor(Math.random() * (i + 1)); [sample[i], sample[j]] = [sample[j], sample[i]] }
+    let cursor = 0, runout = [...board];
+    while (runout.length < 5) runout.push(sample[cursor++]);
+    let mine = evaluate([...h, ...runout]), best = mine, ties = 1;
+    for (let o = 0; o < opponents; o++) {
+      let theirs = evaluate([sample[cursor++], sample[cursor++], ...runout]);
+      let cmp = compareScore(theirs, best);
+      if (cmp > 0) { best = theirs; ties = 1 } else if (cmp === 0) ties++;
+    }
+    let cmp = compareScore(mine, best);
+    if (cmp === 0) score += 1 / ties;
+  }
+  return score / trials
 }
-
 function bot() {
   if (!game || game.winner !== null || !game.started) return;
   let p = game.players[game.turn];
@@ -363,12 +391,17 @@ function bot() {
     level = game.botLevel || 'sharp',
     equity = botEquity(p),
     r = Math.random();
-  let foldBase = level === 'casual' ? .025 : level === 'pro' ? .12 : .06,
-    raiseBase = level === 'casual' ? .08 : level === 'pro' ? .18 : .12;
-  let foldChance = Math.max(0, foldBase + (owed > 0 ? .22 * (1 - equity) : 0)),
-    raiseChance = raiseBase + equity * .3;
+  let potOdds = owed / Math.max(1, game.pot + owed),
+    pressure = Math.min(.16, alive.length * .025),
+    skill = level === 'pro' ? 1 : level === 'sharp' ? .72 : .35,
+    foldChance = Math.max(0, (potOdds + pressure - equity) * (1.25 - skill * .45) + (level === 'casual' ? .07 : .015)),
+    raiseChance = Math.max(.025, (equity - .43) * (.22 + skill * .28) + (owed === 0 ? .05 : 0));
+  // Better bots bluff sparingly, value-bet strong hands, and protect against cheap draws.
   if (owed > 0 && r < foldChance && game.street !== 'river') return act('fold');
-  if (r < raiseChance) return act('raise', max + Math.max(game.minRaise || 2, level === 'pro' ? 8 : 5));
+  if (r < raiseChance) {
+    let sizing = level === 'pro' ? Math.max(game.minRaise || 2, Math.ceil(game.pot * .55)) : Math.max(game.minRaise || 2, 5);
+    return act('raise', max + sizing);
+  }
   if (owed > 0) return act('call');
   return act('check')
 }
@@ -444,6 +477,16 @@ function computeSidePots(playerList) {
   return pots
 }
 
+function tableNeedsReset() {
+  return game && game.players.filter(p => p.chips <= 0).length >= Math.ceil(game.players.length / 2);
+}
+
+function promptTableReset() {
+  if (!game?.needsTableReset) return;
+  $('#tableResetText').textContent = `${game.players.filter(p => p.chips <= 0).length} of ${game.players.length} stacks are empty. Reset every player to $100 before the next hand.`;
+  $('#tableResetModal').classList.remove('hidden');
+}
+
 function finish() {
   if (mode === 'local') {
     let alive = game.players.filter(p => !p.folded);
@@ -486,7 +529,11 @@ function finish() {
   toast(message || 'Hand complete');
   render();
   sync();
-  scheduleAutoHand()
+  game.needsTableReset = tableNeedsReset();
+  if (game.needsTableReset) {
+    toast('Half the table is out — start a fresh game to continue');
+    setTimeout(promptTableReset, 350);
+  } else scheduleAutoHand()
 }
 
 function evaluate(cards) {
@@ -545,11 +592,14 @@ function compareScore(a, b) {
 function render() {
   if (!game) return;
   $('#potValue').textContent = '$' + game.pot;
+  $('#hudFormat').textContent = mode === 'local' ? 'LOCAL TABLE' : mode === 'online' ? 'ONLINE ROOM' : 'SOLO TABLE';
+  $('#hudSeat').textContent = game.winner !== null ? 'HAND COMPLETE' : (game.players[game.turn]?.name || '—').toUpperCase();
+  $('#hudBank').textContent = '$' + game.players.reduce((sum, player) => sum + player.chips, 0);
   $('#streetLabel').textContent = game.winner !== null ? 'SHOWDOWN' : game.street.toUpperCase();
   $('#handNumber').textContent = '#' + String(game.handNo).padStart(3, '0');
   $('#playerCount').textContent = game.players.length;
   $('#rebuyBtn').classList.toggle('hidden', !(mode === 'single' && game.winner !== null && game.players[0]?.chips <= 0));
-  $('#freshStartBtn').classList.toggle('hidden', !(game.winner !== null && game.players.filter(p => p.chips <= 0).length > 4));
+  $('#freshStartBtn').classList.toggle('hidden', !(game.winner !== null && tableNeedsReset()));
   $('#undoBtn').classList.toggle('hidden', !(['single', 'local'].includes(mode) && game.history?.length > 0));
   $('#community').replaceChildren(...(mode === 'local' ? game.community.map((c, i) => {
     let d = document.createElement('div');
@@ -566,7 +616,7 @@ function render() {
     $('#handStrength').textContent = game.winner === null ? estimate(game.players[viewId]?.hand || [], game.community) : ''
   }
   let p = game.players[game.turn],
-    canAct = !game.awaitingWinner && !game.pendingReveal && (mode === 'local' || p.id === myId);
+    canAct = game.started && !game.awaitingWinner && !game.pendingReveal && (mode === 'local' || p.id === myId);
   $('#turnLabel').textContent = game.winner !== null ? 'FINAL HAND' : mode === 'local' ? `${p.name.toUpperCase()} — PASS THE DEVICE` : p.id === myId ? 'YOUR HAND' : `${p.name.toUpperCase()} IS PLAYING`;
   $('#actionHint').textContent = game.winner !== null ? `${game.tiedWinners?.join(' & ')||game.players[game.winner].name} ${game.tiedWinners?'split':'wins'} with ${game.winningScore?.name||'the best hand'}. Start a new hand when ready.` : canAct ? 'Your move — make it count.' : `${p.name} is thinking…`;
   let m = Math.max(...game.players.filter(x => !x.folded).map(x => x.bet));
@@ -576,7 +626,7 @@ function render() {
   $('#actions [data-action="call"]').classList.toggle('hidden', owed === 0);
   $('#actions').classList.toggle('hidden', game.winner !== null || !canAct);
   let raiseRange = $('#raiseRange');
-  if (raiseRange && p) raiseRange.max = String(Math.max(1, p.chips));
+  if (raiseRange && p) raiseRange.max = String(Math.max(1, p.bet + p.chips));
   renderPlayers()
 }
 
@@ -636,8 +686,12 @@ function settleWinner(id) {
   $('#deckStatus').textContent = `${winner.name} wins the pot`;
   toast(`${winner.name} wins $${game.pot}`);
   show($('#gameView'));
+  game.needsTableReset = tableNeedsReset();
   render();
-  scheduleLocalHand()
+  if (game.needsTableReset) {
+    toast('Half the table is out — start a fresh game to continue');
+    setTimeout(promptTableReset, 350);
+  } else scheduleLocalHand()
 }
 
 function setLocalWinner() {
@@ -649,10 +703,12 @@ function estimate(h, c) {
 }
 
 function freshStart() {
-  if (!game || game.winner === null || game.players.filter(p => p.chips <= 0).length <= 4) return;
-  game.players.forEach(p => p.chips += 100);
+  if (!game || game.winner === null || !tableNeedsReset()) return;
+  game.players.forEach(p => p.chips = 100);
+  game.needsTableReset = false;
+  $('#tableResetModal').classList.add('hidden');
   $('#freshStartBtn').classList.add('hidden');
-  toast('Fresh start — $100 added to every stack');
+  toast('Fresh table — every stack reset to $100');
   newHand()
 }
 
@@ -703,8 +759,12 @@ function newHand() {
     $('#deckStatus').textContent = 'Deck ready — cut before dealing'
   }
   render();
-  if (mode !== 'local') setTimeout(deal, 300);
-  else showDealerStep('cut')
+  if (mode === 'local') showDealerStep('cut');
+  else if (mode !== 'online' || connections.length) setTimeout(deal, 300);
+  else {
+    $('#deckStatus').textContent = 'Waiting for a guest to join';
+    $('#actionHint').textContent = 'Share the room code — the hand starts when a guest arrives.';
+  }
 }
 
 function renderRoster() {
@@ -841,6 +901,7 @@ function startConfiguredLocal() {
     }));
   if (data.length < 2) return toast('Add at least 2 players');
   if (data.filter(x => x.blind === 'small').length !== 1 || data.filter(x => x.blind === 'big').length !== 1) return toast('Assign exactly one small blind and one big blind');
+  localStorage.setItem('velvet-stack-saved-players', JSON.stringify(data.map(x => x.name)));
   start('local', data.map(x => x.name), data)
 }
 $$('.mode-card').forEach(b => b.onclick = () => {
@@ -848,7 +909,7 @@ $$('.mode-card').forEach(b => b.onclick = () => {
   else if (b.dataset.mode === 'local') openLocalSetup();
   else start('single')
 });
-$('#backFromLocalSetup').onclick = () => show($('#lobbyView'));
+// The local setup exit is a normal href link, so it stays reliable even if scripts fail.
 $('#addSetupPlayer').onclick = () => {
   if (setupData.length >= 8) return toast('A table can have up to 8 players');
   setupData.push({ name: `Player ${setupData.length+1}`, stack: 100, blind: 'none' });
@@ -856,15 +917,21 @@ $('#addSetupPlayer').onclick = () => {
 };
 $('#startLocalTable').onclick = startConfiguredLocal;
 $('#backToLobby').onclick = () => show($('#lobbyView'));
-$('#leaveGame').onclick = () => {
+function returnToLobby() {
   cancelCountdown(true);
-  peer?.destroy();
+  clearTimeout(window.botTimer); clearTimeout(progressTimer); clearTimeout(autoHandTimer);
+  peer?.destroy(); peer = null; conn = null; connections = []; isHost = false;
+  // Always dismiss every local-table overlay before exposing the lobby.
+  ['#tableResetModal', '#dealerModal', '#helpModal', '#countdownModal'].forEach(id => $(id)?.classList.add('hidden'));
   show($('#lobbyView'))
-};
+}
+$('#leaveGame').onclick = returnToLobby;
+$('#dealerLeave').onclick = returnToLobby;
 $('#playersBtn').onclick = openPlayersPage;
 $('#undoBtn').onclick = undoLast;
 $('#rebuyBtn').onclick = rebuy;
 $('#freshStartBtn').onclick = freshStart;
+$('#resetTableNow').onclick = freshStart;
 $('#backFromPlayers').onclick = () => { show($('#gameView')); render() };
 $('#addPlayerBtn').onclick = addPlayer;
 $('#newPlayerName').onkeydown = e => { if (e.key === 'Enter') addPlayer() };
@@ -883,16 +950,17 @@ $$('.action-btn').forEach(b => b.onclick = () => {
       minIncrement = game?.minRaise || 2,
       range = $('#raiseRange');
     if (p && range) {
-      range.max = String(Math.max(1, p.chips));
-      range.min = String(Math.min(p.chips, minIncrement));
-      range.value = String(Math.min(p.chips, m + minIncrement - p.bet > 0 ? m + minIncrement - p.bet : minIncrement));
-      $('#raiseValue').textContent = '$' + range.value
+      let maxTarget = p.bet + p.chips, minTarget = m + minIncrement;
+      range.max = String(Math.max(1, maxTarget));
+      range.min = String(Math.min(maxTarget, minTarget));
+      range.value = String(Math.min(maxTarget, minTarget));
+      $('#raiseValue').textContent = 'To $' + range.value
     }
     $('#actions').classList.add('hidden');
     $('#raiseControl').classList.remove('hidden')
   } else act(b.dataset.action)
 });
-$('#raiseRange').oninput = e => $('#raiseValue').textContent = '$' + e.target.value;
+$('#raiseRange').oninput = e => $('#raiseValue').textContent = 'To $' + e.target.value;
 $('#confirmRaise').onclick = () => {
   $('#raiseControl').classList.add('hidden');
   $('#actions').classList.remove('hidden');
@@ -941,7 +1009,8 @@ function host() {
       game.players[slot].bot = false;
       c.send({ type: 'welcome', playerId: slot });
       toast(`${game.players[slot].name} joined the room`);
-      sync()
+      sync();
+      if (!game.started) setTimeout(deal, 250)
     });
     c.on('data', d => {
       if (d.type === 'hello' && c.playerId !== undefined) {
@@ -949,7 +1018,9 @@ function host() {
         sync()
       }
       if (d.type === 'action' && c.playerId !== undefined) {
-        if (game.turn === c.playerId) act(d.action, d.amount)
+        let allowed = ['fold', 'check', 'call', 'raise'].includes(d.action);
+        let validAmount = d.action !== 'raise' || (Number.isInteger(d.amount) && d.amount >= 0 && d.amount <= 1000000);
+        if (allowed && validAmount && game.turn === c.playerId) act(d.action, d.amount)
       }
     });
     c.on('close', () => {
@@ -957,7 +1028,12 @@ function host() {
       if (found && game?.players[found.id]) {
         game.players[found.id].name = 'Guest ' + found.id;
         game.players[found.id].bot = true;
-        toast('A player left the room');
+        if (game.started && !game.players[found.id].folded) {
+          game.players[found.id].folded = true;
+          if (game.turn === found.id) advance();
+        }
+        toast('A player left the room — their hand was folded');
+        render();
         sync()
       }
       connections = connections.filter(x => x.conn !== c)
@@ -1000,6 +1076,34 @@ $('#cutDeckBtn').onclick = cutDeck;
 $('#dealHandBtn').onclick = () => { if (!game || mode !== 'local') return; deal() };
 $('#openBoardBtn').onclick = () => { if (game?.pendingReveal) street(true) };
 $('#setWinnerBtn').onclick = setLocalWinner;
+// Settings panel — the top-right gear stores table preferences locally.
+function updateSavedPlayersDetail() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem('velvet-stack-saved-players') || '[]') } catch (_) {}
+  $('#savedPlayersDetail').textContent = saved.length ? saved.join(' · ') : 'No saved local roster yet.'
+}
+function openSettings() {
+  let level = localStorage.getItem('velvet-stack-bot-level') || $('#botLevel').value || 'sharp';
+  let count = localStorage.getItem('velvet-stack-bot-count') || '7';
+  $('#settingsBotLevel').value = level;
+  $('#settingsBotCount').value = count;
+  updateSavedPlayersDetail();
+  $('#settingsModal').classList.remove('hidden')
+}
+$('#soundBtn').onclick = openSettings;
+$('#closeSettings').onclick = () => $('#settingsModal').classList.add('hidden');
+$('#saveSettings').onclick = () => {
+  let level = $('#settingsBotLevel').value, count = $('#settingsBotCount').value;
+  localStorage.setItem('velvet-stack-bot-level', level);
+  localStorage.setItem('velvet-stack-bot-count', count);
+  $('#botLevel').value = level;
+  $('#settingsModal').classList.add('hidden');
+  toast(`Saved: ${level} bots · ${count} opponents`)
+};
+let storedBotLevel = localStorage.getItem('velvet-stack-bot-level');
+if (storedBotLevel) $('#botLevel').value = storedBotLevel;
+document.body.classList.toggle('no-ambient', localStorage.getItem('velvet-stack-ambient') === 'off');
+
 let savedTheme = localStorage.getItem('velvet-stack-theme') || 'emerald';
 document.body.dataset.theme = savedTheme;
 $('#themeSelect').value = savedTheme;
@@ -1007,3 +1111,55 @@ $('#themeSelect').onchange = e => {
   document.body.dataset.theme = e.target.value;
   localStorage.setItem('velvet-stack-theme', e.target.value)
 };
+
+// Ambient felt lighting reacts to pointer movement while leaving gameplay controls stable.
+(function velvetAmbientMotion(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  let queued=false,x=0,y=0;
+  const paint=()=>{queued=false;document.body.style.setProperty('--motion-x',`${x*7}%`);document.body.style.setProperty('--motion-y',`${y*5}%`)};
+  addEventListener('pointermove',e=>{x=e.clientX/innerWidth-.5;y=e.clientY/innerHeight-.5;if(!queued){queued=true;requestAnimationFrame(paint)}},{passive:true});
+})();
+
+// Decorative card meteors: lightweight physical-card drift with chip bursts on contact.
+(function velvetCardMeteors(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const layer=document.querySelector('.ambient-cards');
+  if(!layer) return;
+  layer.querySelectorAll('i').forEach(x=>x.remove());
+  const suits=['♠','♥','♦','♣'], ranks=['A','K','Q','J','10','9','8','7','6','5','4','3','2'];
+  const unoFaces=['+2','+4','↻','⊘','WILD','0','1','2','3','4','5','6','7','8','9'], isUno=document.body.classList.contains('uno');
+  // The revealed loading cards become this page's meteor cards.
+  const faces=window.__velvetAmbientFaces || (window.__velvetAmbientFaces=Array.from({length:5},(_,i)=>{
+    const uno=isUno;
+    return uno ? {uno:true,label:unoFaces[Math.floor(Math.random()*unoFaces.length)]} : {rank:ranks[Math.floor(Math.random()*ranks.length)],suit:suits[Math.floor(Math.random()*suits.length)]};
+  }));
+  // Match the loading row exactly, then fling the revealed cards outward into the room.
+  const dealWidth=76, dealStep=59, startX=innerWidth/2-(dealWidth+(faces.length-1)*dealStep)/2, startY=innerHeight/2-28;
+  const cards=faces.map((face,index)=>{
+    const el=document.createElement('div'),uno=!!face.uno,suit=face.suit||'';
+    el.className='ambient-card'+((suit==='♥'||suit==='♦')?' red':'')+(uno?' uno':'');
+    el.innerHTML=uno ? `<span>${face.label}</span>` : `<b class="ac-rank">${face.rank}</b><b class="ac-suit">${suit}</b><b class="ac-center">${suit}</b>`;
+    layer.append(el);
+    const launch=[[-.82,.06],[-.28,-.74],[0,.86],[.28,-.74],[.82,.06]][index]||[0,.15];return {el,x:startX+index*dealStep,y:startY,vx:launch[0],vy:launch[1],rot:(index-(faces.length-1)/2)*3,vr:(Math.random()-.5)*.08,lastHit:0};
+  });
+  const burst=(x,y)=>{for(let n=0;n<6;n++){const chip=document.createElement('i');chip.className='ambient-chip';chip.style.left=x+'px';chip.style.top=y+'px';chip.style.setProperty('--chip-x',(Math.random()*90-45)+'px');chip.style.setProperty('--chip-y',(Math.random()*90-45)+'px');document.body.append(chip);setTimeout(()=>chip.remove(),750)}};
+  let last=performance.now(), launchedAt=0;
+  const tick=now=>{const step=Math.min(2.2,(now-last)/16.7);last=now;
+    if(!document.body.classList.contains('no-ambient')){
+      cards.forEach(c=>{c.x+=c.vx*step;c.y+=c.vy*step;c.rot+=c.vr*step;if(c.x<-90||c.x>innerWidth+20)c.vx*=-1;if(c.y<-120||c.y>innerHeight+20)c.vy*=-1;c.el.style.transform=`translate3d(${c.x}px,${c.y}px,0) rotate(${c.rot}deg)`});
+      for(let a=0;a<cards.length;a++)for(let b=a+1;b<cards.length;b++){const A=cards[a],B=cards[b];const hit=A.x < B.x+74 && A.x+74 > B.x && A.y < B.y+106 && A.y+106 > B.y;if(launchedAt&&now-launchedAt>3000&&hit&&now-A.lastHit>700){A.lastHit=B.lastHit=now;const overlapX=Math.min(A.x+74,B.x+74)-Math.max(A.x,B.x),overlapY=Math.min(A.y+106,B.y+106)-Math.max(A.y,B.y);const edgeX=(Math.max(A.x,B.x)+Math.min(A.x+74,B.x+74))/2,edgeY=(Math.max(A.y,B.y)+Math.min(A.y+106,B.y+106))/2;if(overlapX<overlapY){const dir=(A.x+37)<(B.x+37)?-1:1,push=overlapX/2+3;A.x+=dir*push;B.x-=dir*push;A.vx=dir*Math.min(.34,Math.max(.18,Math.abs(A.vx)*1.08));B.vx=-dir*Math.min(.34,Math.max(.18,Math.abs(B.vx)*1.08))}else{const dir=(A.y+53)<(B.y+53)?-1:1,push=overlapY/2+3;A.y+=dir*push;B.y-=dir*push;A.vy=dir*Math.min(.34,Math.max(.18,Math.abs(A.vy)*1.08));B.vy=-dir*Math.min(.34,Math.max(.18,Math.abs(B.vy)*1.08))}A.vr*=-1.08;B.vr*=-1.08;burst(edgeX,edgeY)}}
+    } requestAnimationFrame(tick)};
+  // Keep the revealed loading cards in focus, then release this same set into the background.
+  setTimeout(()=>{launchedAt=performance.now();requestAnimationFrame(tick)},2050);
+})();
+
+// Brief deal-in: the exact cards revealed here become the ambient meteor deck.
+(function velvetDealIn(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) { document.body.classList.remove('velvet-loading'); return; }
+  const faces=window.__velvetAmbientFaces;if(!faces){document.body.classList.remove('velvet-loading');return;}
+  const overlay=document.createElement('div');overlay.className='deal-loader';
+  const title=document.createElement('div');title.className='deal-loader-title';title.textContent='VELVET STACK';overlay.append(title);
+  const row=document.createElement('div');row.className='deal-loader-row';
+  faces.forEach((face,i)=>{const c=document.createElement('div'),s=face.suit||'';c.className='deal-loader-card '+((s==='♥'||s==='♦')?'red':'')+(face.uno?' uno':'');c.style.setProperty('--deal-delay',i*.18+'s');c.innerHTML=face.uno?`<b>${face.label}</b>`:`<b>${face.rank}</b><span>${s}</span><em>${s}</em>`;row.append(c)});overlay.append(row);document.body.append(overlay);
+  setTimeout(()=>{overlay.classList.add('exit');setTimeout(()=>{overlay.remove();document.body.classList.remove('velvet-loading')},1050)},1850);
+})();
