@@ -1,6 +1,25 @@
 /* Velvet Stack — static Texas Hold'em table. No build step required. */
 const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
 const SUITS = ['♠', '♥', '♦', '♣'], RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+/* Online connectivity (PeerJS): STUN discovers each player's public address and
+   TURN relays the traffic when direct connection is impossible (mobile data,
+   campus/office Wi-Fi, symmetric NATs) so rooms work between different places. */
+const PEER_OPTS = {
+  debug: 0,
+  config: {
+    iceServers: [
+      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+      { urls: 'stun:openrelay.metered.ca:80' },
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    ],
+    
+  }
+};
+// Namespaces Velvet Stack room IDs on the public PeerJS cloud so short codes
+// cannot collide with other applications' peer IDs.
+const ROOM_PREFIX = 'vstack-poker-';
 let mode = 'single', game = null, myId = 0, peer = null, conn = null, connections = [], isHost = false,
   autoHandTimer = null, progressTimer = null, countdownTimer = null, countdownRemaining = 0;
 
@@ -132,6 +151,9 @@ function deal() {
   if (mode === 'local' && !game.cut) return toast('Cut the deck before dealing');
   hideDealerStep();
   game.players.forEach(p => { p.bet = 0; p.acted = false; p.folded = false });
+  // Online: seats without a connected human sit this hand out so the betting
+  // loop never stalls waiting on an empty chair.
+  if (mode === 'online') game.players.forEach(p => { if (p.bot) { p.folded = true; p.acted = true } });
   game.started = true;
   game.pot = 0;
   game.minRaise = 2;
@@ -169,7 +191,10 @@ function cutDeck() {
 }
 
 function autoProgress() {
-  if (!game || game.winner !== null || !game.started || mode !== 'single') return;
+  // The online HOST is the table authority too: without this, an all-in online
+  // hand would never run out the remaining streets.
+  if (!game || game.winner !== null || !game.started) return;
+  if (!(mode === 'single' || (mode === 'online' && isHost))) return;
   clearTimeout(progressTimer);
   progressTimer = setTimeout(() => {
     if (!game || game.winner !== null) return;
@@ -233,7 +258,8 @@ function street(force = false) {
   }
   game.turn = nextPlayer(game.dealer);
   render();
-  autoProgress()
+  autoProgress();
+  if (mode === 'online' && isHost) sync()
 }
 
 function saveHistory() {
@@ -612,8 +638,11 @@ function render() {
     $('#holeCards').innerHTML = '<span class="hidden-hand-note">Private cards stay with each player</span>';
     $('#handStrength').textContent = ''
   } else {
-    $('#holeCards').replaceChildren(...(game.players[viewId]?.hand || []).map(c => card(c)));
-    $('#handStrength').textContent = game.winner === null ? estimate(game.players[viewId]?.hand || [], game.community) : ''
+    let myHole = (game.players[viewId]?.hand || []).filter(Boolean);
+    $('#holeCards').replaceChildren(...myHole.map(c => card(c)));
+    // Only rate a complete hole hand — an online guest seated mid-hand has no
+    // cards yet, and evaluate() cannot score an empty hand.
+    $('#handStrength').textContent = game.winner === null && myHole.length === 2 ? estimate(myHole, game.community.filter(c => c && !c.hidden)) : ''
   }
   let p = game.players[game.turn],
     canAct = game.started && !game.awaitingWinner && !game.pendingReveal && (mode === 'local' || p.id === myId);
@@ -742,7 +771,8 @@ function newHand() {
       bet: 0,
       totalBet: 0,
       acted: false,
-      bot: mode === 'single' && i > 0
+      // Online keeps each seat's connection status; otherwise solo bots persist.
+      bot: mode === 'online' ? !!p.bot : (mode === 'single' && i > 0)
     })),
     handNo: game.handNo + 1,
     winner: null,
@@ -821,8 +851,11 @@ function removePlayer(index) {
 function sendState(c, recipientId) {
   if (!c?.open) return;
   let view = JSON.parse(JSON.stringify(game));
+  view.history = []; // undo history is host-only; never ship it over the wire
   view.players.forEach(p => {
-    if (p.id !== recipientId && view.winner === null) p.hand = []
+    // Hide other players' cards until showdown, but keep the card COUNT so
+    // guests still see face-down backs at every occupied seat.
+    if (p.id !== recipientId && view.winner === null) p.hand = p.hand.map(() => null)
   });
   c.send({ type: 'state', game: view })
 }
@@ -980,7 +1013,7 @@ function host() {
   let code = '';
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  peer = new Peer(code.toLowerCase(), { debug: 0 });
+  peer = new Peer(ROOM_PREFIX + code.toLowerCase(), PEER_OPTS);
   peer.on('open', () => {
     $('#shareCode').textContent = code;
     $('#roomBadge').classList.remove('hidden');
@@ -989,30 +1022,55 @@ function host() {
     $('#connectionStatus').textContent = 'Room ' + code
   });
   peer.on('error', e => {
-    if (e.type === 'unavailable-id') toast('That room code was busy — please try again');
-    else toast('Could not create the room')
+    if (e.type === 'unavailable-id') { try { peer.destroy() } catch (_) {} host() }
+    else if (e.type === 'network') toast('Signal server lost — reconnecting…');
+    else if (e.type !== 'peer-unavailable') toast('Could not create the room — try again')
   });
+  peer.on('disconnected', () => { try { peer.reconnect() } catch (_) {} });
+  // Heartbeat + periodic state re-broadcast: keeps every guest consistent even
+  // if a single update is lost, and detects vanished players (closed tab,
+  // dropped mobile connection) that never fire a clean close event.
+  clearInterval(window.vsHostPulse);
+  window.vsHostPulse = setInterval(() => {
+    if (!isHost || !peer || peer.destroyed) return clearInterval(window.vsHostPulse);
+    let now = Date.now();
+    connections.slice().forEach(x => {
+      if (!x.conn?.open) return;
+      if (x.lastSeen && now - x.lastSeen > 25000) { try { x.conn.close() } catch (_) {} return }
+      try { x.conn.send({ type: 'ping' }); sendState(x.conn, x.id) } catch (_) {}
+    })
+  }, 6000);
   peer.on('connection', c => {
-    let slot = game ? game.players.findIndex(p => p.bot) : -1;
-    if (slot < 0 && game && game.players.length < 8) {
-      slot = game.players.length;
-      game.players.push({ id: slot, name: 'Guest ' + slot, chips: 100, hand: [], folded: false, bet: 0, totalBet: 0, acted: false, bot: true })
-    }
     c.on('open', () => {
+      // Seat the guest only once the data channel is actually open, so a
+      // failed connection attempt can never inject a ghost seat mid-hand.
+      let slot = game ? game.players.findIndex(p => p.bot) : -1;
+      if (slot < 0 && game && game.players.length < 8) {
+        slot = game.players.length;
+        game.players.push({ id: slot, name: 'Guest ' + slot, chips: 100, hand: [], folded: false, bet: 0, totalBet: 0, acted: false, bot: true })
+      }
       if (!game || slot < 0 || slot >= 8) {
         c.send({ type: 'full' });
         return
       }
-      connections.push({ conn: c, id: slot });
+      connections.push({ conn: c, id: slot, lastSeen: Date.now() });
       c.playerId = slot;
       game.players[slot].name = 'Guest ' + slot;
       game.players[slot].bot = false;
+      // A guest arriving mid-hand sits out until the next deal instead of
+      // entering the betting loop with no hole cards.
+      if (game.started) { game.players[slot].folded = true; game.players[slot].acted = true }
       c.send({ type: 'welcome', playerId: slot });
       toast(`${game.players[slot].name} joined the room`);
+      render();
       sync();
       if (!game.started) setTimeout(deal, 250)
     });
+    c.on('error', () => {});
     c.on('data', d => {
+      let entry = connections.find(x => x.conn === c);
+      if (entry) entry.lastSeen = Date.now();
+      if (d.type === 'pong') return;
       if (d.type === 'hello' && c.playerId !== undefined) {
         game.players[c.playerId].name = (d.name || `Guest ${c.playerId}`).slice(0, 14);
         sync()
@@ -1025,6 +1083,8 @@ function host() {
     });
     c.on('close', () => {
       let found = connections.find(x => x.conn === c);
+      // Drop the dead link first so roster counts and state broadcasts are right.
+      connections = connections.filter(x => x.conn !== c);
       if (found && game?.players[found.id]) {
         game.players[found.id].name = 'Guest ' + found.id;
         game.players[found.id].bot = true;
@@ -1036,7 +1096,6 @@ function host() {
         render();
         sync()
       }
-      connections = connections.filter(x => x.conn !== c)
     })
   })
 }
@@ -1045,15 +1104,43 @@ function join() {
   if (typeof Peer === 'undefined') return toast('Online service unavailable');
   let code = $('#roomCode').value.trim().toLowerCase();
   if (!code) return toast('Enter a room code');
-  peer = new Peer(undefined, { debug: 0 });
+  peer = new Peer(undefined, PEER_OPTS);
+  peer.on('error', e => {
+    if (e.type === 'peer-unavailable') toast('Room not found — check the code and try again');
+    else if (e.type === 'network') toast('Signal server lost — reconnecting…');
+    else toast('Could not join the room — try again');
+    // Fatal errors leave the peer unusable; clear it so Join can be pressed again.
+    if (['browser-incompatible', 'server-error', 'socket-error', 'socket-closed', 'unavailable-id'].includes(e.type)) { try { peer.destroy() } catch (_) {} }
+  });
+  peer.on('disconnected', () => { try { peer.reconnect() } catch (_) {} });
   peer.on('open', () => {
-    conn = peer.connect(code);
+    conn = peer.connect(ROOM_PREFIX + code, { reliable: true, serialization: 'json' });
+    let joinTimer = setTimeout(() => {
+      if (!conn?.open) toast('Could not reach the host — check the code and both players\' connections')
+    }, 15000);
+    conn.on('error', () => toast('Connection problem with the host'));
     conn.on('open', () => {
+      clearTimeout(joinTimer);
       isHost = false;
+      window.vsLastHostMsg = Date.now();
+      // Guest watchdog: if the host goes silent (heartbeats stop), surface it
+      // instead of leaving the player staring at a frozen table.
+      clearInterval(window.vsGuestPulse);
+      window.vsGuestPulse = setInterval(() => {
+        if (!conn?.open) return clearInterval(window.vsGuestPulse);
+        if (window.vsLastHostMsg && Date.now() - window.vsLastHostMsg > 25000) {
+          clearInterval(window.vsGuestPulse);
+          $('#connectionStatus').textContent = 'Connection lost';
+          toast('Connection to the host was lost');
+          try { conn.close() } catch (_) {}
+        }
+      }, 6000);
       conn.send({ type: 'hello', name: ($('#joinName').value || 'Player').slice(0, 14) });
       $('#connectionStatus').textContent = 'Connecting…'
     });
     conn.on('data', d => {
+      window.vsLastHostMsg = Date.now();
+      if (d.type === 'ping') { try { conn.send({ type: 'pong' }) } catch (_) {} return }
       if (d.type === 'welcome') {
         myId = d.playerId;
         $('#connectionStatus').textContent = 'Connected as player ' + (myId + 1);
@@ -1061,13 +1148,17 @@ function join() {
       }
       if (d.type === 'full') toast('This room is full');
       if (d.type === 'state') {
+        // Re-broadcasts arrive every few seconds; only re-render on change.
+        let snapshot = JSON.stringify(d.game);
+        if (snapshot === window.vsLastStateSnapshot) return;
+        window.vsLastStateSnapshot = snapshot;
         game = d.game;
         mode = 'online';
         show($('#gameView'));
         render()
       }
     });
-    conn.on('close', () => toast('Host disconnected'))
+    conn.on('close', () => { clearInterval(window.vsGuestPulse); toast('Host disconnected') })
   })
 }
 $('#hostBtn').onclick = host;

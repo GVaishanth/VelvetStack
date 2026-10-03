@@ -3,7 +3,20 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)], p
 const CONFIG={rummy:{name:'Meld House',kicker:'SEQUENCES & SETS',desc:'Draw, meld, discard. Empty your hand with valid runs and sets.'},ace:{name:'Ace High',kicker:'HIGH CARD HEAT',desc:'Five rounds. Reveal one card each and let the highest card take the point.'},uno:{name:'Color Clash',kicker:'THE COLOR RACE',desc:'Match color or number, use action cards, and call your final card.'},'uno-flip':{name:'UNO Flip!',kicker:'TWO-SIDED CHAOS',desc:'Play through a light side and flip into the darker, higher-penalty side.'}};
 if(!['rummy','uno'].includes(kind)) location.href='index.html';
 document.body.classList.add(kind);
-let mode='solo',game=null,myId=0,peer=null,conn=null,isHost=false,selected=null,pendingWild=null,botTimer=null;
+let mode='solo',game=null,myId=0,peer=null,conn=null,connections=[],isHost=false,selected=null,pendingWild=null,botTimer=null;
+/* Online connectivity (PeerJS): STUN discovers each player's public address and
+   TURN relays the traffic when a direct connection is impossible (mobile data,
+   campus/office Wi-Fi, symmetric NATs) so rooms work between different places. */
+const PEER_OPTS={debug:0,config:{iceServers:[
+  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+  {urls:'stun:openrelay.metered.ca:80'},
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+]}};
+// Namespaced per game so a Meld House code can never collide with a Color Clash
+// room (or another app's peer ID) on the public PeerJS cloud.
+const ROOM_PREFIX=`vstack-${kind}-`;
 const suits=['♠','♥','♦','♣'], ranks=['2','3','4','5','6','7','8','9','T','J','Q','K','A'];
 const $toast=t=>{const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>e.classList.remove('show'),2300)};
 function shuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
@@ -12,7 +25,7 @@ function cardCode(c){const rank=(c.rank==='10'||c.rank==='T')?'0':c.rank,suit={'
 function showGame(){ $('#lobby').classList.add('hidden');$('#game').classList.remove('hidden');document.body.classList.add('in-game') }
 function drawCard(){if(!game.deck.length){if(game.discard.length>1){const top=game.discard.pop();game.deck=shuffle(game.discard);game.discard=[top];if(kind==='rummy'){game.reshuffleCount=(game.reshuffleCount||0)+1}}else game.deck=kind==='ace'?standardDeck():unoDeck()}return game.deck.pop()}
 function setConfig(){const c=CONFIG[kind];$('#gameKicker').textContent=c.kicker;$('#gameTitle').textContent=c.name;$('#gameDescription').textContent=c.desc;$('#gameBarKicker').textContent=c.kicker;$('#gameBarTitle').textContent=c.name;document.title=`${c.name} — Velvet Stack`}
-function newGame(networkMode='solo'){mode=networkMode;selected=null;window.__lastPopupKey=null;hideWinnerPopup();const botCount=Math.max(1,Math.min(7,Number($('#botCount')?.value)||2)),count=networkMode==='solo'?botCount+1:4,names=[$('#playerName').value.trim()||'You','Maya','Theo','Ari','Sam','Lina','Ravi','Nora','Quinn'],ante=Math.max(10,Math.min(5000,Number($('#anteAmount')?.value)||100));game={type:kind,anteAmount:ante,players:Array.from({length:count},(_,i)=>({name:names[i]||`Bot ${i}`,hand:[],score:0,money:1000,finished:false,bot:i>0}),),deck:[],discard:[],turn:0,round:1,maxRounds:5,winner:null,phase:'play',color:null,dark:false,drawStack:0,botLevel:$('#botLevel')?.value||'sharp',botSpeed:$('#botSpeed')?.value||'turbo'};if(mode==='online'&&game.players[1])game.players[1].bot=false;if(kind==='rummy')setupRummy();else if(kind==='ace')setupAce();else setupUno();showGame();render();if(mode==='solo'&&game.turn===1)queueBot()}
+function newGame(networkMode='solo'){if(networkMode==='online'&&!isHost&&conn){$toast('Only the host can start a new game');return}mode=networkMode;selected=null;window.__lastPopupKey=null;hideWinnerPopup();const botCount=Math.max(1,Math.min(7,Number($('#botCount')?.value)||2)),count=networkMode==='solo'?botCount+1:4,names=[$('#playerName').value.trim()||'You','Maya','Theo','Ari','Sam','Lina','Ravi','Nora','Quinn'],ante=Math.max(10,Math.min(5000,Number($('#anteAmount')?.value)||100));game={type:kind,anteAmount:ante,players:Array.from({length:count},(_,i)=>({name:names[i]||`Bot ${i}`,hand:[],score:0,money:1000,finished:false,bot:i>0}),),deck:[],discard:[],turn:0,round:1,maxRounds:5,winner:null,phase:'play',color:null,dark:false,drawStack:0,botLevel:$('#botLevel')?.value||'sharp',botSpeed:$('#botSpeed')?.value||'turbo'};if(mode==='online')connections.forEach(x=>{const seat=game.players[x.id];if(seat&&x.conn?.open){seat.bot=false;if(x.name)seat.name=x.name}});if(kind==='rummy')setupRummy();else if(kind==='ace')setupAce();else setupUno();showGame();render();if(mode==='solo'&&game.turn===1)queueBot();if(mode==='online'&&isHost)sync()}
 function rummyDeck(){let all=standardDeck();all.push({rank:'JOKER',suit:'JOKER',value:'JOKER',joker:true},{rank:'JOKER',suit:'JOKER',value:'JOKER',joker:true});return shuffle(all)}
 function rummyHandSize(playerCount){const bots=playerCount-1;if(bots<=2)return 13;if(bots<=4)return 10;if(bots<=6)return 7;return 4}
 function setupRummy(){game.handSize=rummyHandSize(game.players.length);game.entryFee=game.anteAmount||100;game.pot=game.players.length*game.entryFee;game.finishOrder=[];game.rummyOver=false;game.reshuffleCount=0;game.lastAction=`All players ante $${game.entryFee}. Pot is $${game.pot}.`;game.deck=rummyDeck();game.players.forEach(p=>{p.hand=game.deck.splice(0,game.handSize);p.money-=game.entryFee;p.finished=false});let firstUp=game.deck.pop();while(firstUp.joker){game.deck.unshift(firstUp);firstUp=game.deck.pop()}game.discard=[firstUp];game.phase='draw'}
@@ -21,8 +34,8 @@ function unoDeck(){const colors=game?.dark?['pink','teal','orange','purple']:['r
 function setupUno(){game.dark=kind==='uno-flip'?false:false;game.deck=unoDeck();game.entryFee=game.anteAmount||100;game.pot=game.players.length*game.entryFee;game.players.forEach(p=>{p.hand=game.deck.splice(0,7);p.finished=false;p.money-=game.entryFee});let first=drawCard();while(first.type==='wild4')game.deck.unshift(first),first=drawCard();game.discard=[first];game.color=first.color;game.turn=0;game.phase='play';game.finishOrder=[];game.unoOver=false;game.lastAction=`All players ante $${game.entryFee}. Pot is $${game.pot}.`}
 function current(){return game.players[game.turn]}function wireMovable(hand){const box=$('#hand');[...box.children].forEach((el,i)=>{el.draggable=true;el.dataset.index=i;el.addEventListener('dragstart',e=>{e.dataTransfer.setData('text/plain',String(i));el.classList.add('dragging')});el.addEventListener('dragend',()=>el.classList.remove('dragging'));el.addEventListener('dragover',e=>e.preventDefault());el.addEventListener('drop',e=>{e.preventDefault();const from=Number(e.dataTransfer.getData('text/plain')),to=Number(el.dataset.index);if(Number.isInteger(from)&&Number.isInteger(to)&&from!==to){const [card]=hand.splice(from,1);hand.splice(to,0,card);selected=null;render()}})})}
 function canAct(){return game&&game.winner===null&&game.turn===myId}
-function sendAction(action,data={}){if(mode==='online'&&!isHost){conn?.send({type:'action',action,data});return false}return true}
-function sync(){if(!isHost||!conn?.open)return;const view=JSON.parse(JSON.stringify(game));if(view.winner===null){view.players.forEach((p,i)=>{if(i!==1)p.hand=[]})}conn.send({type:'state',game:view})}
+function sendAction(action,data={}){if(mode==='online'&&!isHost){if(conn?.open)conn.send({type:'action',action,data});else $toast('Not connected to the room yet');return false}return true}
+function sync(){if(mode!=='online'||!isHost)return;connections.forEach(x=>{if(!x.conn?.open)return;const view=JSON.parse(JSON.stringify(game));if(view.winner===null){view.players.forEach((p,i)=>{if(i!==x.id)p.hand=p.hand.map(()=>({hidden:true}))})}x.conn.send({type:'state',game:view})})}
 function showWinnerPopup(){
   if(!game.finishOrder || !game.finishOrder.length) return;
   const key=game.type+':'+game.finishOrder.map(f=>f.name).join(',');
@@ -41,7 +54,7 @@ function showWinnerPopup(){
 }
 function hideWinnerPopup(){$('#winnerPopup').classList.add('hidden')}
 function render(){if(!game)return;
-  $('#roomLabel').textContent=mode==='online'?(isHost?'HOST ROOM':'ONLINE PLAYER'):'';
+  $('#roomLabel').textContent=mode==='online'?(window.__vsRoomCode?'ROOM '+window.__vsRoomCode:(isHost?'HOST ROOM':'ONLINE PLAYER')):'';
   $('#hudMode').textContent=mode==='online'?'ONLINE ROOM':kind.toUpperCase()+' · SOLO';
   $('#hudTurn').textContent=game.winner?'FINAL':(current()?.name||'—').toUpperCase();
   $('#hudPlayers').textContent=`${game.players.length} AT TABLE`;if(kind==='rummy')renderRummy();else if(kind==='ace')renderAce();else renderUno();const over=kind==='rummy'?game.rummyOver:kind==='uno'?game.unoOver:!!game.winner;if(over)showWinnerPopup()}
@@ -105,9 +118,120 @@ function advanceUno(){game.turn=nextUnoTurn(game.turn)}
 function runUnoBots(){if(!(mode==='solo'||(mode==='online'&&isHost)))return;const step=()=>{if(game.unoOver||!game.players[game.turn]?.bot)return;botUno(game.turn);render();sync();if(!game.unoOver&&game.players[game.turn]?.bot)setTimeout(step,botDelay())};if(game.players[game.turn]?.bot)setTimeout(step,botDelay())}
 function botUno(index=game.turn){const p=game.players[index];if(!p||game.unoOver||p.finished)return;let legal=p.hand.map((c,i)=>({c,i})).filter(x=>legalUno(x.c));if(!legal.length){let n=game.drawStack||1;for(let x=0;x<n;x++)p.hand.push(drawCard());game.drawStack=0;game.turn=nextUnoTurn(index);return}const level=game.botLevel||'sharp';let pick=legal[0];if(level!=='casual'){const colorCounts={};p.hand.forEach(x=>{if(x.color!=='wild')colorCounts[x.color]=(colorCounts[x.color]||0)+1});legal.sort((a,b)=>{const score=x=>{let v=(colorCounts[x.c.color]||0)*5;if(x.c.type==='wild4')v+=level==='pro'?18:10;else if(x.c.type==='draw2')v+=level==='pro'?14:8;else if(x.c.type==='skip'||x.c.type==='reverse')v+=6;return v};return score(b)-score(a)});pick=legal[0]}let i=pick.i;const c=p.hand.splice(i,1)[0];game.discard.push(c);if(c.color!=='wild'){game.color=c.color;game.lastAction=null}else{const counts={};p.hand.forEach(x=>{if(x.color!=='wild')counts[x.color]=(counts[x.color]||0)+1});game.color=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0]||'red';game.colorPulse=(game.colorPulse||0)+1;game.pulseColor=game.color;game.lastAction=`${p.name} played a wild and chose ${game.color.toUpperCase()}`}if(c.type==='draw2')game.drawStack=2;if(c.type==='wild4'){game.drawStack=4;if(kind==='uno-flip')game.dark=!game.dark}if(!p.hand.length){completeUno(index,c.type==='skip'||c.type==='reverse');return}if(c.type==='skip'||c.type==='reverse')game.turn=nextUnoTurn(nextUnoTurn(index));else game.turn=nextUnoTurn(index)}
 function queueBot(){clearTimeout(botTimer);if(mode==='solo'&&game&&!game.winner&&game.turn===1)botTimer=setTimeout(()=>{if(kind==='rummy')botRummy();else if(kind==='uno')botUno();else {game.turn=0;render()}},450)}
-function handleRemote(action,data,actor){const before=myId;myId=actor;if(action==='aceReveal')aceReveal();else if(action==='rummyDraw')rummyDraw(data.takeDiscard);else if(action==='rummyDiscard')rummyDiscard(data.index);else if(action==='unoDraw')unoDraw();else if(action==='unoPlay')unoPlay(data.index,data.color);myId=before;render()}
-function hostRoom(){if(typeof Peer==='undefined')return $toast('Online service unavailable');isHost=true;const code=Math.random().toString(36).slice(2,8);peer=new Peer(code);peer.on('open',()=>{newGame('online');$('#roomLabel').textContent='ROOM '+code.toUpperCase()});peer.on('connection',c=>{conn=c;c.on('open',()=>sync());c.on('data',d=>{if(d.type==='action'){handleRemote(d.action,d.data||{},1);sync()}})})}
-function joinRoom(){if(typeof Peer==='undefined')return $toast('Online service unavailable');const code=$('#roomCode').value.trim().toLowerCase();if(!code)return $toast('Enter a room code');isHost=false;myId=1;peer=new Peer();peer.on('open',()=>{conn=peer.connect(code);conn.on('open',()=>{$('#roomLabel').textContent='CONNECTED';$toast('Joined room')});conn.on('data',d=>{if(d.type==='state'){game=d.game;showGame();render()}})})}
+function handleRemote(action,data,actor){
+  // Host-side validation: the action must come from the seat whose turn it is.
+  if(!game||!game.players[actor]||game.turn!==actor)return;
+  const before=myId;myId=actor;
+  if(action==='aceReveal')aceReveal();
+  else if(action==='rummyDraw')rummyDraw(data.takeDiscard);
+  else if(action==='rummyDiscard')rummyDiscard(data.index);
+  else if(action==='unoDraw')unoDraw();
+  else if(action==='unoPlay')unoPlay(data.index,data.color);
+  myId=before;render()
+}
+function roomCode6(){const chars='abcdefghjkmnpqrstuvwxyz23456789';let s='';for(let i=0;i<6;i++)s+=chars[Math.floor(Math.random()*chars.length)];return s}
+function hostRoom(){
+  if(typeof Peer==='undefined')return $toast('Online service unavailable');
+  isHost=true;myId=0;connections=[];
+  const code=roomCode6();
+  peer=new Peer(ROOM_PREFIX+code,PEER_OPTS);
+  peer.on('open',()=>{window.__vsRoomCode=code.toUpperCase();newGame('online');$('#roomLabel').textContent='ROOM '+code.toUpperCase();$toast(`Room ${code.toUpperCase()} is live — share the code`)});
+  // Heartbeat + periodic state re-broadcast: keeps guests consistent if an
+  // update is lost and detects vanished players that never fire a close event.
+  clearInterval(window.vsHostPulse);
+  window.vsHostPulse=setInterval(()=>{
+    if(!isHost||!peer||peer.destroyed)return clearInterval(window.vsHostPulse);
+    const now=Date.now();
+    connections.slice().forEach(x=>{
+      if(!x.conn?.open)return;
+      if(x.lastSeen&&now-x.lastSeen>25000){try{x.conn.close()}catch(_){}return}
+      try{x.conn.send({type:'ping'})}catch(_){}
+    });
+    sync()
+  },6000);
+  peer.on('error',e=>{
+    if(e.type==='unavailable-id'){try{peer.destroy()}catch(_){ }hostRoom()}
+    else if(e.type==='network')$toast('Signal server lost — reconnecting…');
+    else if(e.type!=='peer-unavailable')$toast('Could not create the room — try again')
+  });
+  peer.on('disconnected',()=>{try{peer.reconnect()}catch(_){}});
+  peer.on('connection',c=>{
+    c.on('open',()=>{
+      // Seat the guest in the first bot chair that no live guest already holds.
+      const slot=game?game.players.findIndex((p,i)=>i>0&&p.bot&&!connections.some(x=>x.id===i&&x.conn?.open)):-1;
+      if(slot<0){c.send({type:'full'});setTimeout(()=>{try{c.close()}catch(_){}},400);return}
+      connections=connections.filter(x=>x.id!==slot);
+      connections.push({conn:c,id:slot,name:null,lastSeen:Date.now()});
+      c.playerId=slot;
+      game.players[slot].bot=false;
+      game.players[slot].name='Guest '+slot;
+      c.send({type:'welcome',playerId:slot});
+      game.lastAction=`${game.players[slot].name} joined the table`;
+      $toast('A player joined the room');
+      render();sync()
+    });
+    c.on('data',d=>{
+      const beat=connections.find(x=>x.conn===c);if(beat)beat.lastSeen=Date.now();
+      if(d.type==='pong')return;
+      if(!game||c.playerId===undefined)return;
+      if(d.type==='hello'){const entry=connections.find(x=>x.conn===c);const name=String(d.name||('Guest '+c.playerId)).slice(0,14);if(entry)entry.name=name;game.players[c.playerId].name=name;render();sync();return}
+      if(d.type==='action'){handleRemote(d.action,d.data||{},c.playerId);sync()}
+    });
+    c.on('close',()=>{
+      connections=connections.filter(x=>x.conn!==c);
+      if(game&&c.playerId!==undefined&&game.players[c.playerId]){
+        game.players[c.playerId].bot=true;
+        game.lastAction=`${game.players[c.playerId].name} left — a bot plays the seat`;
+        $toast('A player left — a bot plays the seat');
+        if(!game.winner&&game.players[game.turn]?.bot){if(kind==='rummy')runRummyBots();else if(kind==='uno'||kind==='uno-flip')runUnoBots()}
+        render();sync()
+      }
+    });
+    c.on('error',()=>{});
+  })
+}
+function joinRoom(){
+  if(typeof Peer==='undefined')return $toast('Online service unavailable');
+  const code=$('#roomCode').value.trim().toLowerCase();
+  if(!code)return $toast('Enter a room code');
+  isHost=false;
+  $toast('Connecting to the room…');
+  peer=new Peer(PEER_OPTS);
+  peer.on('error',e=>{
+    if(e.type==='peer-unavailable')$toast('Room not found — check the code and try again');
+    else if(e.type==='network')$toast('Signal server lost — reconnecting…');
+    else $toast('Could not join the room — try again');
+    if(['browser-incompatible','server-error','socket-error','socket-closed','unavailable-id'].includes(e.type)){try{peer.destroy()}catch(_){}}
+  });
+  peer.on('disconnected',()=>{try{peer.reconnect()}catch(_){}});
+  peer.on('open',()=>{
+    conn=peer.connect(ROOM_PREFIX+code,{reliable:true,serialization:'json'});
+    const joinTimer=setTimeout(()=>{if(!conn?.open)$toast('Could not reach the host — check the code and both connections')},15000);
+    conn.on('open',()=>{
+      clearTimeout(joinTimer);
+      window.__vsRoomCode=code.toUpperCase();
+      $('#roomLabel').textContent='ROOM '+code.toUpperCase();
+      window.vsLastHostMsg=Date.now();
+      // Guest watchdog: surface a silent host instead of a frozen table.
+      clearInterval(window.vsGuestPulse);
+      window.vsGuestPulse=setInterval(()=>{
+        if(!conn?.open)return clearInterval(window.vsGuestPulse);
+        if(window.vsLastHostMsg&&Date.now()-window.vsLastHostMsg>25000){clearInterval(window.vsGuestPulse);$toast('Connection to the host was lost');try{conn.close()}catch(_){}}
+      },6000);
+      conn.send({type:'hello',name:($('#playerName').value.trim()||'Player').slice(0,14)});
+      $toast('Joined the room')
+    });
+    conn.on('data',d=>{
+      window.vsLastHostMsg=Date.now();
+      if(d.type==='ping'){try{conn.send({type:'pong'})}catch(_){}return}
+      if(d.type==='welcome'){myId=d.playerId}
+      if(d.type==='full')$toast('This room is full');
+      if(d.type==='state'){const snap=JSON.stringify(d.game);if(snap===window.vsLastStateSnapshot)return;window.vsLastStateSnapshot=snap;game=d.game;mode='online';showGame();render()}
+    });
+    conn.on('close',()=>{clearInterval(window.vsGuestPulse);$toast('Host disconnected')});
+    conn.on('error',()=>$toast('Connection problem with the host'))
+  })
+}
 function showFinishChoice(){$('#finishModal').classList.remove('hidden')}
 function hideFinishChoice(){$('#finishModal').classList.add('hidden')}
 function skipToEnd(){
